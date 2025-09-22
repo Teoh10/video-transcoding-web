@@ -13,12 +13,21 @@ export async function authRequired(req, res, next) {
 
   try {
     const payload = await verifier.verify(token);
+    const cognitoUsername = payload["cognito:username"];
+    const username = cognitoUsername || payload.username || payload.email || payload.sub;
+    const userId = cognitoUsername || payload.sub || payload.email || payload.username;
 
-    // Attach decoded user to request
-    req.user = payload;
+    if (!userId) {
+      return res.status(401).json({ error: "Token missing user identifier" });
+    }
 
-    // Extract groups (if none, fallback to empty array)
-    req.user.groups = payload["cognito:groups"] || [];
+    // Attach normalized user information to request
+    req.user = {
+      ...payload,
+      id: userId,
+      username,
+      groups: payload["cognito:groups"] || []
+    };
 
     next();
   } catch (err) {
