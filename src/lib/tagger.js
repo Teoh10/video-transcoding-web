@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import { cacheRememberJson } from "./cache.js";
 import { ensureParametersLoaded } from "../config/parameterStore.js";
 
 let cachedConfig = null;
@@ -19,37 +20,45 @@ async function getTaggerConfig() {
   return cachedConfig;
 }
 
-export async function classifyImageAtPath(imagePath) {
-  const { token, model, topK, minScore } = await getTaggerConfig();
-  if (!token) return [];
-  const bytes = await fs.readFile(imagePath);
+export async function classifyImageAtPath(imagePath, { cacheKey } = {}) {
+  const loadTags = async () => {
+    const { token, model, topK, minScore } = await getTaggerConfig();
+    if (!token) return [];
+    const bytes = await fs.readFile(imagePath);
 
-  const res = await fetch(
-    `https://api-inference.huggingface.co/models/${encodeURIComponent(model)}`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/octet-stream",
-        "Accept": "application/json",
-        "x-wait-for-model": "true"
-      },
-      body: bytes
+    const res = await fetch(
+      `https://api-inference.huggingface.co/models/${encodeURIComponent(model)}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/octet-stream",
+          "Accept": "application/json",
+          "x-wait-for-model": "true"
+        },
+        body: bytes
+      }
+    );
+
+    if (!res.ok) {
+      throw new Error(`[tagger] HF error ${res.status}`);
     }
-  );
 
-  if (!res.ok) {
-    throw new Error(`[tagger] HF error ${res.status}`);
+    const data = await res.json();
+    if (!Array.isArray(data)) return [];
+
+    return data
+      .slice(0, topK)
+      .map((entry) => ({
+        tag: entry?.label,
+        score: typeof entry?.score === "number" ? entry.score : undefined
+      }))
+      .filter((entry) => entry.tag && (entry.score === undefined || entry.score >= minScore));
+  };
+
+  if (!cacheKey) {
+    return loadTags();
   }
 
-  const data = await res.json();
-  if (!Array.isArray(data)) return [];
-
-  return data
-    .slice(0, topK)
-    .map((entry) => ({
-      tag: entry?.label,
-      score: typeof entry?.score === "number" ? entry.score : undefined
-    }))
-    .filter((entry) => entry.tag && (entry.score === undefined || entry.score >= minScore));
+  return cacheRememberJson(cacheKey, process.env.VIDEO_TAG_CACHE_TTL_SECONDS, loadTags);
 }

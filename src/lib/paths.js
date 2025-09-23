@@ -1,6 +1,7 @@
 import { S3Client, DeleteObjectCommand, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { ensureParametersLoaded } from "../config/parameterStore.js";
+import { cacheRememberJson, cacheSetJson, cacheDelete } from "./cache.js";
 
 await ensureParametersLoaded(["AWS_REGION", "QUT_USERNAME"]);
 import {
@@ -51,6 +52,48 @@ const LOCKED_AT_ATTR = "transcodeLockedAt";
 const videoSk = (userId, videoId) => `${USER_PREFIX}${userId}${VIDEO_SEGMENT}${videoId}`;
 const videoPrefixForUser = (userId) => `${USER_PREFIX}${userId}${VIDEO_SEGMENT}`;
 const userProfileSk = (username) => `${USERPROFILE_PREFIX}${username}`;
+
+function numberOrDefault(value, fallback) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : fallback;
+}
+
+const VIDEO_CACHE_TTL_SECONDS = numberOrDefault(process.env.VIDEO_CACHE_TTL_SECONDS, 300);
+const VIDEO_LIST_CACHE_TTL_SECONDS = numberOrDefault(process.env.VIDEO_LIST_CACHE_TTL_SECONDS, 120);
+const VIDEO_TAG_CACHE_TTL_SECONDS = numberOrDefault(process.env.VIDEO_TAG_CACHE_TTL_SECONDS, VIDEO_CACHE_TTL_SECONDS);
+
+const cacheKeys = {
+  video: (userId, videoId) => `video:${userId}:${videoId}`,
+  tags: (videoId) => `video:${videoId}:tags`,
+  listByUser: (userId) => `videos:list:${userId}`,
+  listAll: 'videos:list:all'
+};
+
+async function primeVideoCache(video) {
+  if (!video) {
+    return;
+  }
+  await Promise.all([
+    cacheSetJson(cacheKeys.video(video.userId, video.videoId), video, VIDEO_CACHE_TTL_SECONDS),
+    cacheSetJson(cacheKeys.tags(video.videoId), video.tags ?? [], VIDEO_TAG_CACHE_TTL_SECONDS)
+  ]);
+}
+
+async function invalidateVideoLists(userId) {
+  const tasks = [cacheDelete(cacheKeys.listAll)];
+  if (userId) {
+    tasks.push(cacheDelete(cacheKeys.listByUser(userId)));
+  }
+  await Promise.all(tasks);
+}
+
+async function removeVideoCaches(userId, videoId) {
+  await Promise.all([
+    cacheDelete(cacheKeys.video(userId, videoId)),
+    cacheDelete(cacheKeys.tags(videoId))
+  ]);
+  await invalidateVideoLists(userId);
+}
 
 export function buildVideoBaseKey(userId, videoId) {
   return `user/${userId}/videos/${videoId}`;
@@ -128,67 +171,90 @@ export const videoRepo = {
       }
     });
     await ddbDocClient.send(command);
-    return sanitizeVideo(item);
+    const created = sanitizeVideo(item);
+    await Promise.all([
+      primeVideoCache(created),
+      invalidateVideoLists(userId)
+    ]);
+    return created;
   },
 
   // ✅ Put listAll() here, NOT inside create()
   async listAll() {
-    const items = [];
-    let ExclusiveStartKey;
+    return cacheRememberJson(cacheKeys.listAll, VIDEO_LIST_CACHE_TTL_SECONDS, async () => {
+      const items = [];
+      let ExclusiveStartKey;
 
-    do {
+      do {
+        const command = new QueryCommand({
+          TableName: DDB_TABLE,
+          KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+          ExpressionAttributeNames: {
+            "#pk": PARTITION_KEY_ATTR,
+            "#sk": SORT_KEY_ATTR
+          },
+          ExpressionAttributeValues: {
+            ":pk": QUT_USERNAME,
+            ":prefix": "USER#"   // matches all users
+          },
+          ExclusiveStartKey
+        });
+
+        const { Items = [], LastEvaluatedKey } = await ddbDocClient.send(command);
+        items.push(...Items.map(sanitizeVideo).filter(Boolean));
+        ExclusiveStartKey = LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+
+      const sorted = items.sort((a, b) =>
+        (b.createdAt || "").localeCompare(a.createdAt || "")
+      );
+      await Promise.all(sorted.map(primeVideoCache));
+      return sorted;
+    });
+  },
+
+
+  async get(userId, videoId) {
+    const cacheKey = cacheKeys.video(userId, videoId);
+    return cacheRememberJson(cacheKey, VIDEO_CACHE_TTL_SECONDS, async () => {
+      const command = new GetCommand({
+        TableName: DDB_TABLE,
+        Key: {
+          [PARTITION_KEY_ATTR]: QUT_USERNAME,
+          [SORT_KEY_ATTR]: videoSk(userId, videoId)
+        }
+      });
+      const { Item } = await ddbDocClient.send(command);
+      const video = sanitizeVideo(Item);
+      if (video) {
+        await cacheSetJson(cacheKeys.tags(videoId), video.tags ?? [], VIDEO_TAG_CACHE_TTL_SECONDS);
+      }
+      return video;
+    });
+  },
+
+  async listByUser(userId) {
+    const cacheKey = cacheKeys.listByUser(userId);
+    return cacheRememberJson(cacheKey, VIDEO_LIST_CACHE_TTL_SECONDS, async () => {
       const command = new QueryCommand({
         TableName: DDB_TABLE,
         KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
         ExpressionAttributeNames: {
           "#pk": PARTITION_KEY_ATTR,
-          "#sk": SORT_KEY_ATTR,
+          "#sk": SORT_KEY_ATTR
         },
         ExpressionAttributeValues: {
           ":pk": QUT_USERNAME,
-          ":prefix": "USER#",   // matches all users
-        },
-        ExclusiveStartKey,
+          ":prefix": videoPrefixForUser(userId)
+        }
       });
-
-      const { Items = [], LastEvaluatedKey } = await ddbDocClient.send(command);
-      items.push(...Items.map(sanitizeVideo).filter(Boolean));
-      ExclusiveStartKey = LastEvaluatedKey;
-    } while (ExclusiveStartKey);
-
-    return items.sort((a, b) =>
-      (b.createdAt || "").localeCompare(a.createdAt || "")
-    );
-  },
-
-
-  async get(userId, videoId) {
-    const command = new GetCommand({
-      TableName: DDB_TABLE,
-      Key: {
-        [PARTITION_KEY_ATTR]: QUT_USERNAME,
-        [SORT_KEY_ATTR]: videoSk(userId, videoId)
-      }
+      const { Items = [] } = await ddbDocClient.send(command);
+      const videos = Items.map(sanitizeVideo)
+        .filter(Boolean)
+        .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+      await Promise.all(videos.map(primeVideoCache));
+      return videos;
     });
-    const { Item } = await ddbDocClient.send(command);
-    return sanitizeVideo(Item);
-  },
-
-  async listByUser(userId) {
-    const command = new QueryCommand({
-      TableName: DDB_TABLE,
-      KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
-      ExpressionAttributeNames: {
-        "#pk": PARTITION_KEY_ATTR,
-        "#sk": SORT_KEY_ATTR
-      },
-      ExpressionAttributeValues: {
-        ":pk": QUT_USERNAME,
-        ":prefix": videoPrefixForUser(userId)
-      }
-    });
-    const { Items = [] } = await ddbDocClient.send(command);
-    return Items.map(sanitizeVideo).filter(Boolean).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
   },
 
   async markProcessing(userId, videoId, workerId) {
@@ -221,7 +287,14 @@ export const videoRepo = {
     });
 
     const { Attributes } = await ddbDocClient.send(command);
-    return sanitizeVideo(Attributes);
+    const video = sanitizeVideo(Attributes);
+    if (video) {
+      await Promise.all([
+        primeVideoCache(video),
+        invalidateVideoLists(video.userId)
+      ]);
+    }
+    return video;
   },
 
   async findQueuedVideos(limit = 10) {
@@ -342,7 +415,14 @@ export const videoRepo = {
 
     try {
       const { Attributes } = await ddbDocClient.send(command);
-      return sanitizeVideo(Attributes);
+      const video = sanitizeVideo(Attributes);
+      if (video) {
+        await Promise.all([
+          primeVideoCache(video),
+          invalidateVideoLists(video.userId)
+        ]);
+      }
+      return video;
     } catch (err) {
       if (err?.name === 'ConditionalCheckFailedException') {
         return null;
@@ -384,7 +464,14 @@ export const videoRepo = {
     });
 
     const { Attributes } = await ddbDocClient.send(command);
-    return sanitizeVideo(Attributes);
+    const video = sanitizeVideo(Attributes);
+    if (video) {
+      await Promise.all([
+        primeVideoCache(video),
+        invalidateVideoLists(video.userId)
+      ]);
+    }
+    return video;
   },
 
   async markFailed(userId, videoId, message = "Unknown error") {
@@ -413,7 +500,14 @@ export const videoRepo = {
     });
 
     const { Attributes } = await ddbDocClient.send(command);
-    return sanitizeVideo(Attributes);
+    const video = sanitizeVideo(Attributes);
+    if (video) {
+      await Promise.all([
+        primeVideoCache(video),
+        invalidateVideoLists(video.userId)
+      ]);
+    }
+    return video;
   },
 
   async markCanceled(userId, videoId) {
@@ -429,6 +523,7 @@ export const videoRepo = {
       }
     });
     await ddbDocClient.send(command);
+    await removeVideoCaches(userId, videoId);
   }
 };
 

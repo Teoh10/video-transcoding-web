@@ -9,7 +9,7 @@ import { mediaRoutes } from "./routes/media.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureParametersLoaded } from "./config/parameterStore.js";
-
+import { connectToMemcached } from "./lib/cache.js";
 const app = express();
 
 const bootstrap = async () => {
@@ -27,6 +27,7 @@ const bootstrap = async () => {
   const PORT = process.env.PORT || 8000;
   const HOST = process.env.HOST || "0.0.0.0"; // bind to all interfaces for Docker/EC2
 
+  connectToMemcached();
   app.use(cors({ origin: CORS_ORIGIN === "*" ? undefined : CORS_ORIGIN }));
   app.use(morgan("dev"));
   app.use(express.json({ limit: process.env.REQUEST_BODY_LIMIT || "10mb" }));

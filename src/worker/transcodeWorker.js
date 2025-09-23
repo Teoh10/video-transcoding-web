@@ -23,6 +23,7 @@ await ensureParametersLoaded(["TRANSCODE_LOCK_TTL_MS"]);
 const WORKER_ID = `${os.hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 const POLL_INTERVAL_MS = Number(process.env.TRANSCODE_POLL_MS || 5000);
 const LOCK_TTL_MS = Number(process.env.TRANSCODE_LOCK_TTL_MS || 5 * 60 * 1000);
+const videoTagsCacheKey = (videoId) => `video:${videoId}:tags`;
 
 let current = null; // { userId, videoId, abortController }
 let running = false;
@@ -96,7 +97,7 @@ async function processVideo(video) {
 
     let tags = [];
     try {
-      tags = await classifyImageAtPath(thumbnailPath);
+      tags = await classifyImageAtPath(thumbnailPath, { cacheKey: videoTagsCacheKey(videoId) });
     } catch (tagErr) {
       console.warn("[worker] tagging failed", tagErr?.message || tagErr);
     }
