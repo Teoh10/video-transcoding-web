@@ -20,11 +20,6 @@ import {
   cancelCurrentTranscode,
 } from "../worker/transcodeWorker.js";
 import { createUploadUrl } from "../lib/s3Presign.js";
-import {
-  cacheGetJSON,
-  cacheSetJSON,
-  buildVideosListKey,
-} from "../lib/cache.js";
 function normalizeDuration(value) {
   if (value === undefined || value === null || value === "") return undefined;
   const num = Number(value);
@@ -130,7 +125,6 @@ export function videoRoutes() {
           originalKey,
           duration,
         });
-        await bumpNamespace(userId);   // 🔹 Invalidate cache for this user
 
         notifyTranscodeWorker();
         return res.status(201).json({ video: buildVideoResponse(created) });
@@ -189,7 +183,6 @@ export function videoRoutes() {
           originalKey,
           duration,
         });
-        await bumpNamespace(userId);   // 🔹 Invalidate cache for this user
 
         notifyTranscodeWorker();
 
