@@ -29,7 +29,8 @@ const bootstrap = async () => {
     "TAGS_TOP_K",
     "TAGS_MIN_SCORE",
     "QUT_USERNAME",
-    "TRANSCODE_LOCK_TTL_MS"
+    "TRANSCODE_LOCK_TTL_MS",
+    "SQS_QUEUE_URL"
   ]);
   console.log("✅ Parameters loaded from AWS SSM Parameter Store");
 

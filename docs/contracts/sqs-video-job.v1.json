@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cab432.example.com/contracts/sqs-video-job.v1.json",
+  "title": "SQS Video Job v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "jobId",
+    "videoId",
+    "bucket",
+    "originalKey",
+    "renditions",
+    "userId",
+    "submittedAt"
+  ],
+  "properties": {
+    "v": {
+      "const": 1,
+      "description": "Schema version. Future versions must increment this integer."
+    },
+    "jobId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique job identifier (UUID v4)."
+    },
+    "videoId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Video identifier used as the DynamoDB sort key."
+    },
+    "bucket": {
+      "type": "string",
+      "minLength": 3,
+      "description": "S3 bucket that stores the original and output objects."
+    },
+    "originalKey": {
+      "type": "string",
+      "minLength": 1,
+      "description": "S3 object key for the original uploaded asset."
+    },
+    "renditions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "List of rendition identifiers the worker must produce (e.g. 240p, 360p, 480p).",
+      "minItems": 1
+    },
+    "userId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Cognito subject of the uploader."
+    },
+    "submittedAt": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix epoch milliseconds when the job was enqueued."
+    }
+  }
+}

@@ -195,7 +195,7 @@ export const videoRepo = {
       UpdateExpression:
         "SET #status = :processing, #updatedAt = :updatedAt, #lockedBy = :lockedBy, #lockedAt = :lockedAt REMOVE #errorMessage",
       ConditionExpression:
-        "#status = :queued AND attribute_not_exists(#lockedBy)",
+        "(#status = :queued OR #status = :failed) AND attribute_not_exists(#lockedBy)",
       ExpressionAttributeNames: {
         "#status": "status",
         "#updatedAt": "updatedAt",
@@ -207,6 +207,7 @@ export const videoRepo = {
         ":processing": "processing",
         ":updatedAt": now,
         ":queued": "queued",
+        ":failed": "failed",
         ":lockedBy": workerId,
         ":lockedAt": now,
       },

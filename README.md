@@ -509,3 +509,29 @@ ISC (see `package.json`)
 - **Manual job injection**: If the API service is not yet available you can enqueue a job by (1) uploading an `original.mp4` into `s3://$S3_BUCKET/user/<USER_ID>/videos/<VIDEO_ID>/original.mp4`, and (2) inserting the matching DynamoDB item with status `queued` (see `src/lib/paths.js::videoRepo.create` for the item shape). The worker will poll DynamoDB and pick it up.
 - **Local env**: Supply AWS credentials (via `~/.aws` volume) and either set `USE_PARAMETER_STORE=false` with explicit env vars in `.env`, or sign in with AWS SSO so the worker can read Parameter Store and Secrets Manager at startup.
 - **ECS rollout**: Create a separate ECS/Fargate service for the worker image (e.g., `cab432-worker`) using the same IAM task role as the API, allocate higher CPU/memory, and point the task definition command to `npm run worker`. The service can scale independently using CloudWatch alarms on job backlog metrics.
+
+### SQS job contract
+
+- The versioned message schema that the API will publish to SQS is stored at `docs/contracts/sqs-video-job.v1.json`. The payload shape is:
+  ```json
+  {
+    "v": 1,
+    "jobId": "uuid-v4",
+    "videoId": "ddb-key",
+    "bucket": "videos-bucket",
+    "originalKey": "originals/user/123/abc.mp4",
+    "renditions": ["240p", "360p", "480p"],
+    "userId": "cognito-sub",
+    "submittedAt": 1739912345678
+  }
+  ```
+- Team members must treat the worker contract as owned by the worker team. Any additions must be backward compatible (append-only). Bump `v` and add a new schema file if we ever introduce breaking changes.
+- DLQ handling is intentionally deferred; we will wire SQS + DLQ logic in a subsequent iteration.
+
+### SQS Load Distribution
+
+- Set `SQS_QUEUE_URL` (and optional `TRANSCODE_RENDITIONS`, `SQS_WAIT_TIME_SECONDS`, `SQS_VISIBILITY_TIMEOUT_SECONDS`) so both the API and worker know which queue to use.
+- The API publishes a versioned job (see `docs/contracts/sqs-video-job.v1.json`) whenever a video is created; failures mark the video as `failed` so the UI reflects the issue.
+- The worker performs long polling against SQS, marks the video as `processing` in DynamoDB, and keeps the message invisible until FFmpeg finishes or a failure occurs. Unhandled failures allow SQS redrive/DLQ in future work.
+- Local dev: run `docker compose up --build` (or `npm run start` + `npm run worker`) with AWS credentials and a real SQS queue so jobs flow end-to-end.
+- Cloud: provision the queue + IAM permissions, inject the queue URL into both ECS task definitions, and scale the worker service based on `ApproximateNumberOfMessagesVisible`.

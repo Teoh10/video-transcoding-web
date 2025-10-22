@@ -13,13 +13,10 @@ import {
   getS3Bucket,
   buildOriginalKey,
 } from "../lib/paths.js";
-import {
-  notifyTranscodeWorker,
-  getCurrentTranscodeId,
-  cancelCurrentTranscode,
-} from "../worker/transcodeWorker.js";
 import { createUploadUrl } from "../lib/s3Presign.js";
 import { bumpNamespace, buildVideosListKey, cacheGetJSON, cacheSetJSON } from "../lib/cache.js";
+import { enqueueTranscodeJob } from "../lib/jobQueue.js";
+import { getCurrentTranscodeId, cancelCurrentTranscode } from "../worker/transcodeWorker.js";
 
 function normalizeDuration(value) {
   if (value === undefined || value === null || value === "") return undefined;
@@ -126,7 +123,17 @@ export function videoRoutes() {
           duration,
         });
         await bumpNamespace(userId); // 🔹 Invalidate cache
-        notifyTranscodeWorker();
+        try {
+          await enqueueTranscodeJob(created);
+        } catch (queueErr) {
+          console.error("Failed to enqueue transcode job", queueErr);
+          try {
+            await videoRepo.markFailed(userId, videoId, "Queue publish failed");
+          } catch (markErr) {
+            console.error("Failed to mark video as failed after enqueue error", markErr);
+          }
+          return res.status(502).json({ error: "Failed to queue video for processing" });
+        }
         return res.status(201).json({ video: buildVideoResponse(created) });
       } catch (err) {
         if (err?.name === "ConditionalCheckFailedException") {

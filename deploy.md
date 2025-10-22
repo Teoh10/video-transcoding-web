@@ -74,3 +74,11 @@ TAGS_TOP_K / TAGS_MIN_SCORE: configure filtering thresholds for auto-generated t
 QUT_USERNAME: identifies the student for marking.
 
 TRANSCODE_LOCK_TTL_MS: timeout for distributed locking of video transcoding jobs.
+
+SQS queue setup
+----------------
+1. Create a standard SQS queue (e.g. `cab432-transcode-jobs`) and note its URL.
+2. (Optional) Create a dead-letter queue and attach it with an appropriate redrive policy for future DLQ handling.
+3. Grant the API and worker task roles `sqs:SendMessage`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`, and `sqs:GetQueueAttributes` on the queue.
+4. Inject `SQS_QUEUE_URL=<queue-url>` into both the API and worker environments (ECS task definition or `.env`).
+5. For scaling, monitor `ApproximateNumberOfMessagesVisible` and attach an ECS Service Auto Scaling policy that adds worker tasks when the queue backlog grows.

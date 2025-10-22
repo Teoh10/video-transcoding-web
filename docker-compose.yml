@@ -11,6 +11,7 @@ services:
       - PORT=${PORT:-8000}
       - AWS_PROFILE=CAB432-STUDENT-901444280953
       - MEMCACHED_ENDPOINT=memcached:11211
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
     volumes:
       - ${USERPROFILE}/.aws:/root/.aws:ro
     ports:
@@ -34,8 +35,9 @@ services:
     env_file:
     - .env
     environment:
-    - AWS_PROFILE=CAB432-STUDENT-901444280953
-    - MEMCACHED_ENDPOINT=memcached:11211
+      - AWS_PROFILE=CAB432-STUDENT-901444280953
+      - MEMCACHED_ENDPOINT=memcached:11211
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
     volumes:
     - ${USERPROFILE}/.aws:/root/.aws:ro
     depends_on:

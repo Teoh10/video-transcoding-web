@@ -21,19 +21,27 @@ import {
   ffprobeDurationSeconds,
 } from "../lib/ffmpeg.js";
 import { classifyImageAtPath } from "../lib/tagger.js";
-import { ensureParametersLoaded } from "../config/parameterStore.js";
-
-await ensureParametersLoaded(["TRANSCODE_LOCK_TTL_MS"]);
+import {
+  receiveTranscodeMessages,
+  deleteTranscodeMessage,
+  extendTranscodeMessageVisibility,
+  parseTranscodeJobBody,
+} from "../lib/jobQueue.js";
 
 const WORKER_ID = `${os.hostname()}-${process.pid}-${Math.random()
   .toString(36)
   .slice(2, 8)}`;
-const POLL_INTERVAL_MS = Number(process.env.TRANSCODE_POLL_MS || 5000);
-const LOCK_TTL_MS = Number(process.env.TRANSCODE_LOCK_TTL_MS || 5 * 60 * 1000);
+const VISIBILITY_TIMEOUT_SECONDS = Number(
+  process.env.SQS_VISIBILITY_TIMEOUT_SECONDS || 900
+);
+const VISIBILITY_HEARTBEAT_SECONDS = Number(
+  process.env.SQS_VISIBILITY_HEARTBEAT_SECONDS ||
+    Math.max(60, Math.floor(VISIBILITY_TIMEOUT_SECONDS / 2))
+);
+const WAIT_TIME_SECONDS = Number(process.env.SQS_WAIT_TIME_SECONDS || 20);
 
+let shouldRun = false;
 let current = null; // { userId, videoId, abortController }
-let running = false;
-let scheduled = false;
 
 function bucket() {
   return getS3Bucket();
@@ -127,6 +135,7 @@ async function processVideo(video) {
         : err?.message || "Transcode failed";
     console.error("[worker] transcode failed", userId, videoId, err);
     await videoRepo.markFailed(userId, videoId, message).catch(() => {});
+    throw err;
   } finally {
     current = null;
     if (tmpDir) {
@@ -135,64 +144,112 @@ async function processVideo(video) {
   }
 }
 
-async function reclaimStaleJobs() {
-  const cutoffIso = new Date(Date.now() - LOCK_TTL_MS).toISOString();
-  const stale = await videoRepo.findStaleProcessing(cutoffIso, 10);
-  for (const job of stale) {
-    const reset = await videoRepo.requeueVideo(job.userId, job.videoId);
-    if (reset) {
-      console.warn(`[worker] Re-queued stale job ${job.videoId}`);
-    }
+function startVisibilityExtender(receiptHandle) {
+  if (!receiptHandle || VISIBILITY_HEARTBEAT_SECONDS <= 0) {
+    return () => {};
   }
+  let stopped = false;
+  const timer = setInterval(() => {
+    if (stopped) return;
+    extendTranscodeMessageVisibility(
+      receiptHandle,
+      VISIBILITY_TIMEOUT_SECONDS
+    ).catch((err) => {
+      console.warn("[worker] failed to extend message visibility", err);
+    });
+  }, VISIBILITY_HEARTBEAT_SECONDS * 1000);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
-async function workCycle() {
-  if (running) {
-    scheduled = true;
+async function handleMessage(message) {
+  let job;
+  try {
+    job = parseTranscodeJobBody(message.Body);
+  } catch (err) {
+    console.warn("[worker] dropping malformed job payload", err);
+    await deleteTranscodeMessage(message.ReceiptHandle);
     return;
   }
-  running = true;
+
+  const { userId, videoId } = job;
+  let lockedVideo;
   try {
-    let processed;
-    do {
-      processed = false;
-      await reclaimStaleJobs();
-      const claimed = await videoRepo.claimNextQueuedVideo(WORKER_ID, 5);
-      if (claimed) {
-        processed = true;
-        await processVideo(claimed);
-      }
-    } while (processed);
+    lockedVideo = await videoRepo.markProcessing(userId, videoId, WORKER_ID);
   } catch (err) {
-    console.error("[worker] cycle error", err);
+    if (err?.name === "ConditionalCheckFailedException") {
+      console.warn(
+        `[worker] job ${job.jobId} skipped (status no longer queued)`
+      );
+      await deleteTranscodeMessage(message.ReceiptHandle);
+      return;
+    }
+    throw err;
+  }
+
+  if (!lockedVideo) {
+    await deleteTranscodeMessage(message.ReceiptHandle);
+    return;
+  }
+
+  const videoInput = {
+    ...lockedVideo,
+    originalKey: lockedVideo.originalKey || job.originalKey,
+  };
+
+  const stopExtender = startVisibilityExtender(message.ReceiptHandle);
+  try {
+    await processVideo(videoInput);
+    await deleteTranscodeMessage(message.ReceiptHandle);
+  } catch (err) {
+    console.error(
+      `[worker] job ${job.jobId} failed (message will be retried)`,
+      err?.message || err
+    );
+    // Intentionally do not delete message so SQS can redrive or move to DLQ.
   } finally {
-    running = false;
-    if (scheduled) {
-      scheduled = false;
-      queueMicrotask(workCycle);
+    stopExtender();
+  }
+}
+
+async function pollQueue() {
+  while (shouldRun) {
+    try {
+      const { messages } = await receiveTranscodeMessages({
+        maxNumber: 1,
+        waitSeconds: WAIT_TIME_SECONDS,
+        visibilityTimeout: VISIBILITY_TIMEOUT_SECONDS,
+      });
+      if (!messages.length) {
+        continue;
+      }
+      for (const message of messages) {
+        if (!shouldRun) break;
+        await handleMessage(message);
+      }
+    } catch (err) {
+      console.error("[worker] poll loop error", err);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 }
 
-let pollTimer = null;
-
-function schedulePolling() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-  }
-  pollTimer = setInterval(() => {
-    workCycle();
-  }, POLL_INTERVAL_MS);
+export async function startTranscodeWorker() {
+  if (shouldRun) return;
+  shouldRun = true;
+  console.log(
+    `[worker] ${WORKER_ID} starting (wait=${WAIT_TIME_SECONDS}s, visibility=${VISIBILITY_TIMEOUT_SECONDS}s)`
+  );
+  pollQueue().catch((err) => {
+    console.error("[worker] poll loop crashed", err);
+    process.exit(1);
+  });
 }
 
-export function startTranscodeWorker() {
-  console.log(`[worker] ${WORKER_ID} starting`);
-  schedulePolling();
-  workCycle();
-}
-
-export function notifyTranscodeWorker() {
-  queueMicrotask(workCycle);
+export function stopTranscodeWorker() {
+  shouldRun = false;
 }
 
 export function getCurrentTranscodeId() {
