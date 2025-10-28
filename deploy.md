@@ -8,14 +8,14 @@ Need to do "aws configure sso" to able to sign in to s3
 AWS_REGION=ap-southeast-2
 AWS_ACCOUNT_ID=901444280953
 REPO=g58-a3
-TAG=v5
+TAG=v6
 ECR_URI=901444280953.dkr.ecr.ap-southeast-2.amazonaws.com/g58-a3
 
 docker-worker
 AWS_REGION=ap-southeast-2
 AWS_ACCOUNT_ID=901444280953
 REPO=g58-worker
-TAG=v1
+TAG=v2
 ECR_URI=901444280953.dkr.ecr.ap-southeast-2.amazonaws.com/g58-worker
 
 aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS --password-stdin 901444280953.dkr.ecr.ap-southeast-2.amazonaws.com
