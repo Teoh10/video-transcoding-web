@@ -69,11 +69,6 @@ variable "transcode_lock_ttl_ms" {
   default     = 300000
 }
 
-variable "upload_bucket" {
-  description = "Existing S3 bucket where original uploads are stored"
-  type        = string
-}
-
 variable "worker_image" {
   description = "ECR image URI for the transcode worker"
   type        = string
@@ -102,7 +97,7 @@ variable "ecs_cluster_name" {
 variable "ecs_service_name" {
   description = "Name of the ECS service to create"
   type        = string
-  default     = "a3-g58-worker-microservice"
+  default     = "g58-worker-task-service-uf5324mq"
 }
 
 variable "worker_desired_count" {
@@ -151,8 +146,31 @@ variable "worker_assign_public_ip" {
   default     = false
 }
 
+variable "worker_container_port" {
+  description = "Container port exposed by the worker service (for service discovery)"
+  type        = number
+  default     = 3000
+}
+
 variable "worker_cpu_target" {
   description = "CPU percentage target for ECS autoscaling"
   type        = number
   default     = 60
+}
+
+variable "vpc_id" {
+  description = "VPC ID where ECS tasks run (needed for Cloud Map namespace)"
+  type        = string
+}
+
+variable "custom_metric_namespace" {
+  description = "CloudWatch namespace for custom backlog metrics"
+  type        = string
+  default     = "Custom/g58/Transcode"
+}
+
+variable "worker_count_baseline" {
+  description = "Fallback worker count used by the Lambda when ECS describe fails"
+  type        = number
+  default     = 1
 }

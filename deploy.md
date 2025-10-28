@@ -90,14 +90,15 @@ The Lambda source for the custom scaling metric lives at `lambda/transcode-metri
 
 ### Deploy the Lambda
 - Zip the file: `zip -j lambda.zip lambda/transcode-metrics/index.mjs`.
-- Create the function (Node.js 20) with an execution role that can read the SSM parameter `/cab432/g57/app/SQS_QUEUE_URL`, call `sqs:GetQueueAttributes`, `cloudwatch:PutMetricData`, and (optionally) `ecs:DescribeServices` if the role can inspect the ECS service.
+- Create the function (Node.js 20) with an execution role that can read the SSM parameter `/cab432/g57/app/SQS_QUEUE_URL`, call `sqs:GetQueueAttributes`, `cloudwatch:PutMetricData`, and `ecs:DescribeServices`.
 - Set environment variables:
   - `AWS_REGION=ap-southeast-2`
   - `PARAMETER_STORE_PREFIX=/cab432/g57/app/`
   - `SQS_QUEUE_PARAM_KEY=SQS_QUEUE_URL`
+  - `CUSTOM_METRIC_NAMESPACE=Custom/g58/Transcode`
+  - `ECS_CLUSTER_NAME=a3-g58-worker-microservice`
+  - `ECS_SERVICE_NAME=g58-worker-task-service-uf5324mq`
   - `WORKER_COUNT_BASELINE=1` (fallback when ECS permissions are not available)
-  - Optional: `ECS_CLUSTER_NAME=a3-g58-worker-microservice`, `ECS_SERVICE_NAME=a3-g58-worker-microservice`
-  - Optional: `CUSTOM_METRIC_NAMESPACE=Custom/g58/Transcode`
 
 ### Schedule the Metric Publisher
 - Create an EventBridge rule (e.g. `rate(1 minute)`) that invokes the Lambda.
@@ -109,41 +110,34 @@ The Lambda source for the custom scaling metric lives at `lambda/transcode-metri
 - Attach a target-tracking policy on metric `BacklogPerWorker` with target value `2`. Use your existing `g58-SQS-QueueHigh`/`Low` alarms as fallbacks for step scaling if desired.
 - Set min/max task counts (e.g. min 1, max 10) and test by pushing messages onto the queue; watch the metric cross the target and trigger scale out/in.
 
-## Lambda: S3 Upload Dispatcher
+## Lambda: Custom Scaling Metric
 
-`lambda/s3-upload-dispatch/index.mjs` is a serverless entry point that reacts to new `original.mp4` uploads and enqueues the matching transcode job on SQS. This avoids wiring EventBridge schedules if your account lacks those permissions.
+`lambda/transcode-metrics/index.mjs` publishes backlog metrics (`QueueVisible`, `BacklogPerWorker`, etc.) to CloudWatch.
 
-### Deploy the Dispatcher
-- Zip it: `zip -j lambda-s3-dispatch.zip lambda/s3-upload-dispatch/index.mjs`.
-- Create a Lambda (Node.js 20) with an execution role that can read `/cab432/g57/app/SQS_QUEUE_URL` from SSM and call `sqs:SendMessage`.
-- Configure environment variables:
-  - `AWS_REGION=ap-southeast-2`
-  - `PARAMETER_STORE_PREFIX=/cab432/g57/app/`
-  - `SQS_QUEUE_PARAM_KEY=SQS_QUEUE_URL`
-  - Optional: `SQS_QUEUE_URL` (direct value if you prefer not to read Parameter Store)
-  - Optional: `EXPECTED_BUCKET_NAME=<your-private-video-bucket>` to filter events from the target bucket only
-
-### Wire the Trigger
-- In S3, add an event notification on the bucket (ObjectCreated, suffix `original.mp4`) targeting the Lambda.
-- Upload a test video using the standard key pattern `user/<userId>/videos/<videoId>/original.mp4`.
-- Verify the Lambda logs the dispatch and an SQS message appears in queue `a3-g58-workerqueue`; the worker service should pick up the job as usual.
+- Ensure the Lambda `g58-lambda-customscaling` uses the IAM role from Terraform (SSM + SQS + optional ECS describe access).
+- After deployment, run a test event in the Lambda console; check CloudWatch Logs for the payload, and verify the `Custom/g58/Transcode` namespace receives new data points.
+- Optional: point an EventBridge schedule at the Lambda so metrics update automatically every minute.
 
 ## Terraform IaC
 
 - Populate `terraform/terraform.tfvars` (example below) with your AWS-specific values before running Terraform:
   ```hcl
   qut_username             = "n1234567@qut.edu.au"
-  upload_bucket            = "g58-transcode-uploads"
   worker_image             = "901444280953.dkr.ecr.ap-southeast-2.amazonaws.com/g58-worker:v1"
   ecs_execution_role_arn   = "arn:aws:iam::901444280953:role/cab432-ecs-execution"
   ecs_task_role_arn        = "arn:aws:iam::901444280953:role/cab432-ecs-task"
   ecs_cluster_arn          = "arn:aws:ecs:ap-southeast-2:901444280953:cluster/a3-g58-worker-microservice"
   ecs_cluster_name         = "a3-g58-worker-microservice"
+  vpc_id                   = "vpc-abc123"
   worker_subnet_ids        = ["subnet-abc", "subnet-def"]
   worker_security_group_id = "sg-123"
+  worker_container_port    = 3000
   ```
 - From the `terraform/` directory run `terraform fmt`, `terraform init`, and `terraform plan -out tfplan`. Inspect the plan to confirm the SQS queue, DLQ, Parameter Store keys, Lambda, and ECS worker service match expectations. Capture a screenshot of the plan for submission.
 - Apply in your sandbox account with `terraform apply tfplan`. After the run finishes:
-- Check SSM Parameter Store for `/cab432/g57/app/...` values.
-  - Verify the Lambda function `g58-s3-upload-dispatch` exists and can enqueue to SQS (trigger it via S3 upload and watch CloudWatch logs/SQS queue).
+  - Check SSM Parameter Store for `/cab432/g57/app/...` values.
+  - Verify the Lambda function `g58-lambda-customscaling` exists and is emitting metrics (invoke it manually and inspect CloudWatch Logs/Metrics).
   - Confirm the ECS service `a3-g58-worker-microservice` is up and tied to the queue; watch the worker scale when queue depth hits the CloudWatch alarms.
+  - Validate ECS advanced features:
+    - **Service discovery**: from an EC2 instance or ECS task inside the VPC run `dig g58-worker.g58.local` (adjust if you changed names) and confirm it resolves to the worker task IP. You can also run `aws servicediscovery list-instances --service-id <id>` to see the registered instances.
+    - **Rolling updates with failure detection**: deploy a bad task definition revision (e.g., wrong port) and watch ECS automatically roll back thanks to the circuit breaker (`Deployment failed` event in the ECS console). Capture the CloudWatch event or console screenshot.

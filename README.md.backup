@@ -1,0 +1,521 @@
+# CAB432 Video Transcoding Platform
+
+A cloud-native, production-grade video processing platform built with Node.js, Express, and AWS services. The system handles video uploads, transcoding to multiple resolutions, thumbnail generation, and auto-tagging using a scalable, decoupled architecture.
+
+## 🚀 Quick Start (Local Development)
+
+```bash
+# Clone and install
+git clone <repository-url>
+cd CAB432
+npm ci
+
+# Configure AWS credentials
+aws configure --profile CAB432-STUDENT-901444280953
+
+# Run with Docker Compose (includes Memcached)
+docker-compose up --build
+
+# Or run locally
+npm run dev
+```
+
+The application will be available at http://localhost:8000
+
+## 🏗️ Production Architecture
+
+In production, the platform is deployed as a **decoupled, auto-scaling** system across multiple AWS services:
+
+### Compute Planes
+
+**API Tier (EC2 + ALB + Auto Scaling)**
+- **Route 53**: DNS resolution for `g58.cab432.com` → Application Load Balancer
+- **Application Load Balancer**: Terminates HTTPS, performs health checks on `/api/v1/health`, distributes traffic across EC2 instances
+- **EC2 Auto Scaling Group**: Runs Express API containers, scales based on CPU/ALB metrics
+- **Purpose**: Handle user authentication, video metadata CRUD, presigned URL generation, SQS job enqueueing
+
+**Worker Tier (ECS Fargate + Custom Scaling)**
+- **Amazon ECS Service**: Runs FFmpeg worker containers on Fargate
+- **SQS Queue**: `a3-g58-workerqueue` decouples API from workers
+- **Custom Metric Scaling**: EventBridge + Lambda publishes `BacklogPerWorker` metric (queue depth / running tasks) every minute
+- **Application Auto Scaling**: Adjusts ECS task count based on `BacklogPerWorker` threshold
+- **Purpose**: Process video transcoding jobs asynchronously, independent of API load
+
+### Core AWS Components
+
+| Service | Role | Rationale |
+|---------|------|-----------|
+| **Route 53** | DNS routing to ALB | Global DNS with health checks, failover support |
+| **Application Load Balancer** | HTTPS termination, traffic distribution | Managed TLS certificates, connection draining, health probing |
+| **EC2 (API)** | Stateless API serving | Cost-effective for steady traffic, flexible instance types |
+| **Auto Scaling (EC2)** | Scale API tier by demand | Match capacity to traffic spikes, reduce over-provisioning |
+| **Amazon ECS Fargate** | Container orchestration for workers | No server management, built-in task isolation, pay-per-second billing |
+| **SQS Queue + DLQ** | Job decoupling, fault tolerance | Guarantees at-least-once delivery, automatic retries, dead-letter isolation |
+| **EventBridge + Lambda** | Custom metrics collection | Scheduled CloudWatch metric publishing for scaling decisions |
+| **Application Auto Scaling** | ECS task count adjustment | Scales workers based on queue backlog, ensures timely processing |
+| **S3** | Object storage (originals, renditions, thumbnails) | Infinite capacity, presigned URLs offload traffic from API |
+| **DynamoDB** | Video metadata, job state | Single-digit ms latency, auto-scaling, single-table design |
+| **ElastiCache (Memcached)** | Cache video list queries | Sub-millisecond reads, namespace invalidation strategy |
+| **Cognito** | User authentication, JWT issuance | Managed OAuth2, MFA support, group-based authorization |
+| **Secrets Manager** | Sensitive credentials (API keys, tokens) | Automatic rotation, encryption at rest, audit logs |
+| **SSM Parameter Store** | Non-sensitive config (regions, URLs) | Hierarchical namespacing, version history |
+| **CloudWatch** | Logs, metrics, alarms, dashboards | Centralized observability, automated alerting |
+
+**Optional Edge Services**:
+- **CloudFront**: CDN for processed videos (low-latency playback)
+- **SNS**: Job completion notifications
+- **S3 Lifecycle Rules**: Archive old originals to Glacier
+
+### Data Flow: Upload → Transcode → Delivery
+
+```
+1. Client → API (EC2):  POST /api/v1/videos (initiate upload)
+2. API → DynamoDB:      Create video record (status=queued)
+3. API → SQS:           Enqueue transcoding job message
+4. API → Client:        Return presigned S3 PUT URL
+5. Client → S3:         Upload original.mp4 directly (bypasses API)
+6. ECS Worker → SQS:    Poll queue for messages
+7. Worker → S3:         Download original.mp4
+8. Worker → FFmpeg:     Transcode to 1080p/720p/480p, extract thumbnail
+9. Worker → S3:         Upload renditions + thumbnail
+10. Worker → DynamoDB:  Update video (status=completed, renditions, duration)
+11. Worker → SQS:       Delete message (acknowledge success)
+12. Client → API:       GET /api/v1/videos/:id (poll for completion)
+13. API → DynamoDB:     Read metadata (cached in ElastiCache)
+14. API → Client:       Return presigned S3 GET URLs for streaming
+15. Client → S3:        Stream video directly
+```
+
+**Failure Handling**:
+- SQS retries failed messages up to 3 times (MaxReceiveCount)
+- After 3 failures, message moves to Dead Letter Queue (DLQ)
+- Worker sets DynamoDB status to `failed` and logs error
+- CloudWatch Alarm triggers on DLQ depth > 0
+
+### Scaling Strategy
+
+**API Tier (EC2)**:
+- Target Tracking Scaling: Maintain 70% average CPU utilization
+- ALB Request Count per Target: Scale out if > 1000 requests/target/minute
+- Min: 2 instances (high availability), Max: 10 instances
+
+**Worker Tier (ECS)**:
+- Custom Metric: `BacklogPerWorker` = (ApproximateNumberOfMessages + ApproximateNumberOfMessagesNotVisible) / RunningTaskCount
+- Target: 2 messages per worker (ensures queue drains within SLA)
+- EventBridge rule triggers Lambda every 60 seconds
+- Lambda queries SQS queue attributes, ECS service task count → publishes CloudWatch metric
+- Application Auto Scaling adjusts ECS desired count
+- Min: 1 task (cost optimization), Max: 20 tasks (burst capacity)
+
+For detailed architecture diagrams, component interactions, and deployment guides, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+
+# for dlq testing
+# 1) Run app
+docker compose up --build
+# 2) Open new terminal
+docker compose stop worker
+# 3) Upload  video
+# 4) control F , search = "enqueued video", copy the <VIDEO_ID>
+# 5) go S3 Console and delete user/<USER_ID>/videos/<VIDEO_ID>/
+# 6) open a new terminal, run below
+docker compose logs -f worker
+docker compose start worker
+# (will see [sqs] batch received size=1 ... ... NoSuchKey: The specified key does not exist)
+
+
+# BELOW show in AWS page (when present)
+“Max receives is 3. The worker failed to fetch the file three times without deleting the message, so SQS moved it to the DLQ. Here are the DLQ messages and their bodies.”
+
+1) Show DLQ has messages
+Go: SQS → Queues → a3-g58-workerqueue-dlq
+On the Details tab, point to Messages available (e.g., “2”).
+
+2) Open and read a DLQ message
+Click Send and receive messages (top-right).
+Click Poll for messages (if nothing shows).
+Tick a message → click View details.
+In the right panel:
+Body: shows userId, videoId, originalKey.
+Attributes: shows ApproximateReceiveCount.
+
+
+
+
+
+A cloud-native video processing application built with Node.js, Express, and AWS services. Users can upload videos, which are automatically transcoded into multiple resolutions, thumbnailed, and auto-tagged using machine learning. The platform supports authentication, multi-user access, admin controls, and stateless horizontal scaling.Need to do "aws configure sso" to able to sign in to s3
+
+
+
+## 🎯 Project Goals
+
+
+
+- **Scalable video processing**: Handle uploads, transcode to multiple resolutions (1080p, 720p, 480p), and generate thumbnails using FFmpeg.1. docker
+
+- **Cloud-native architecture**: Leverage AWS services (Cognito, S3, DynamoDB, Secrets Manager, Parameter Store, ElastiCache) for authentication, storage, metadata, configuration, and caching.AWS_REGION=ap-southeast-2
+
+- **Stateless design**: All persistent state lives in AWS; the application can be restarted or scaled horizontally without data loss.AWS_ACCOUNT_ID=901444280953
+
+- **Auto-tagging**: Classify video thumbnails using the Hugging Face Inference API to enable tag-based filtering.REPO=g57-a2
+
+- **Role-based access**: Regular users manage their own videos; admins can delete any video.TAG=v8
+
+ECR_URI=901444280953.dkr.ecr.ap-southeast-2.amazonaws.com/g57-a2
+
+## ✨ Features
+
+aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS --password-stdin 901444280953.dkr.ecr.ap-southeast-2.amazonaws.com
+
+### Core Functionalitydocker build -t ${REPO}:${TAG} .
+
+- **User Authentication** (AWS Cognito)docker tag ${REPO}:${TAG} ${ECR_URI}:${TAG}
+
+  - Registration with email confirmationdocker push ${ECR_URI}:${TAG}
+
+  - Login with username/password
+
+  - JWT-based stateless authentication2. deploy
+
+  - Group-based authorization (Admin group)aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS --password-stdin 901444280953.dkr.ecr.ap-southeast-2.amazonaws.com
+## ✨ Features
+
+### Core Functionality
+
+- **User Authentication** (AWS Cognito)
+  - Registration with email confirmation
+  - Login with username/password
+  - JWT-based stateless authentication
+  - Group-based authorization (Admin group)
+
+- **Video Upload & Management**
+  - Direct upload via presigned S3 URLs (client → S3, bypasses API for large files)
+  - Video listing with pagination, search, status/tag filtering
+  - Single video retrieval with ETag caching
+  - Cancel in-progress transcodes
+  - Admin-only video deletion
+
+- **Automated Transcoding Pipeline**
+  - ECS workers poll SQS queue for jobs
+  - Transcodes to 1080p, 720p, 480p using FFmpeg
+  - Generates thumbnail at 3-second mark
+  - Updates DynamoDB with renditions, thumbnail, duration
+  - Handles failures with automatic retries (SQS) and DLQ isolation
+  - Supports graceful cancellation via AbortController
+
+- **Media Delivery**
+  - Presigned S3 URLs for streaming and downloading
+  - Resolution selection (original, 1080p, 720p, 480p)
+  - Thumbnail serving with fallback SVG placeholder
+
+- **Caching** (AWS ElastiCache / Memcached)
+  - Namespace-based cache invalidation for video lists
+  - Automatic cache warming on queries
+  - Graceful degradation if cache is unavailable
+
+### Cloud Services Integration
+
+- **AWS Cognito**: User pool, JWT verification, MFA support
+- **Amazon S3**: Private bucket, presigned URLs for secure access
+- **Amazon DynamoDB**: Single-table design for video metadata, job queue
+- **Amazon SQS**: Decoupled job queue with DLQ for poison messages
+- **Amazon ECS**: Fargate-based worker orchestration with auto-scaling
+- **AWS Secrets Manager**: Secure storage for API keys, tokens
+- **AWS Systems Manager Parameter Store**: Non-sensitive configuration
+- **AWS ElastiCache (Memcached)**: In-memory cache for hot queries
+- **AWS EventBridge + Lambda**: Custom metric collection for scaling
+- **AWS CloudWatch**: Centralized logging, metrics, alarms, dashboards
+
+## 📚 Documentation
+
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)**: Detailed system design, data flows, scaling strategies, and deployment architecture
+- **[API_REFERENCE.md](./API_REFERENCE.md)**: Complete REST API documentation with request/response schemas
+
+
+
+## 🔧 Environment Setup
+
+### Prerequisites
+
+**Local Development**
+- Node.js 20 LTS
+- FFmpeg installed and available on PATH
+- AWS CLI configured with `CAB432-STUDENT-901444280953` profile
+- AWS account access (Cognito, S3, DynamoDB, Secrets Manager, SSM, ElastiCache)
+
+**Docker Development**
+- Docker Desktop
+- AWS CLI configured for credential mounting
+
+
+sudo apt-get install -y docker.io
+sudo systemctl enable docker --now
+sudo usermod -aG docker ubuntu
+```
+
+4. **Pull and run container**
+```bash
+# Login to ECR
+aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS --password-stdin <aws-account-id>.dkr.ecr.ap-southeast-2.amazonaws.com
+
+# Pull image
+docker pull <aws-account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cab432-app:latest
+
+# Run (set environment variables for production)
+docker run -d \
+  --name cab432-app \
+  -p 8000:8000 \
+  -e AWS_REGION=ap-southeast-2 \
+  -e S3_BUCKET=<your-s3-bucket> \
+  -e DDB_TABLE=<your-dynamodb-table> \
+  -e QUT_USERNAME=<your-qut-username> \
+  -e COGNITO_USER_POOL_ID=<your-pool-id> \
+  -e COGNITO_CLIENT_ID=<your-client-id> \
+  -e COGNITO_REGION=ap-southeast-2 \
+  -e MEMCACHED_ENDPOINT=<your-elasticache-endpoint>:11211 \
+  -e USE_PARAMETER_STORE=true \
+  -e PARAMETER_STORE_PREFIX=/cab432/g57/app/ \
+  --restart unless-stopped \
+  <aws-account-id>.dkr.ecr.ap-southeast-2.amazonaws.com/cab432-app:latest
+```
+
+5. **Configure Route53**
+   - Create a CNAME record (e.g., `g57.cab432.com`) pointing to your EC2 public DNS
+   - For HTTPS (Assessment 3), update the CNAME to point to a load balancer or CloudFront distribution with TLS
+
+### Verify Deployment
+
+```bash
+# Health check
+curl http://<ec2-public-ip>:8000/api/v1/health
+
+# Should return: {"ok":true}
+```
+
+## 🧪 Testing
+
+### Manual Testing
+
+1. **Register a user**
+```bash
+curl -X POST http://localhost:8000/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser","password":"Test1234!","email":"test@example.com"}'
+```
+
+2. **Confirm email** (check your email for the code)
+```bash
+curl -X POST http://localhost:8000/api/v1/auth/confirm \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser","code":"123456"}'
+```
+
+3. **Login**
+```bash
+TOKEN=$(curl -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser","password":"Test1234!"}' \
+  | jq -r .token)
+```
+
+4. **Upload a video** (presigned URL method)
+```bash
+# Request upload URL
+UPLOAD=$(curl -X POST http://localhost:8000/api/v1/videos/upload-url \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"contentType":"video/mp4"}')
+
+VIDEO_ID=$(echo $UPLOAD | jq -r .videoId)
+UPLOAD_URL=$(echo $UPLOAD | jq -r .uploadUrl)
+
+# Upload file to S3
+curl -X PUT "$UPLOAD_URL" \
+  -H "Content-Type: video/mp4" \
+  --upload-file sample.mp4
+
+# Mark upload complete
+curl -X POST http://localhost:8000/api/v1/videos/$VIDEO_ID/complete \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"My Test Video","duration":60}'
+```
+
+5. **List videos**
+```bash
+curl http://localhost:8000/api/v1/videos?page=1&pageSize=10 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+6. **Get video details**
+```bash
+curl http://localhost:8000/api/v1/videos/$VIDEO_ID \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+7. **Stream/download**
+```bash
+# Get streaming URL
+curl http://localhost:8000/api/v1/videos/$VIDEO_ID/stream?res=720 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Cache Testing
+
+```bash
+# First request (CACHE_MISS in server logs)
+curl http://localhost:8000/api/v1/videos?page=1 \
+  -H "Authorization: Bearer $TOKEN"
+
+# Second request (CACHE_HIT in server logs)
+curl http://localhost:8000/api/v1/videos?page=1 \
+  -H "Authorization: Bearer $TOKEN"
+
+# Check server logs for:
+# CACHE_MISS listVideos:v1:<userId>:ns0:page=1&pageSize=10
+# CACHE_HIT listVideos:v1:<userId>:ns0:page=1&pageSize=10
+```
+
+## 📁 Project Structure
+
+```
+cab432/
+├── src/
+│   ├── index.js                 # Express app bootstrap
+│   ├── config/
+│   │   ├── parameterStore.js    # AWS SSM Parameter Store loader
+│   │   └── secretManager.js     # AWS Secrets Manager loader
+│   ├── routes/
+│   │   ├── auth.js              # Cognito registration/login
+│   │   ├── me.js                # User profile endpoint
+│   │   ├── videos.js            # Video CRUD, list, cancel, delete
+│   │   └── media.js             # Stream, download, thumbnail endpoints
+│   ├── middleware/
+│   │   └── auth.js              # JWT verification, group checks
+│   ├── lib/
+│   │   ├── paths.js             # DynamoDB repo, S3/DDB clients
+│   │   ├── s3Presign.js         # S3 presigned URL generation
+│   │   ├── ffmpeg.js            # FFmpeg wrappers (transcode, thumbnail)
+│   │   ├── tagger.js            # Hugging Face image classification
+│   │   ├── cache.js             # Memcached client wrapper
+│   │   └── upload.js            # Multer config for multipart uploads
+│   └── worker/
+│       └── transcodeWorker.js   # Background job processor
+├── public/                      # Frontend SPA (HTML/JS/CSS)
+│   ├── index.html
+│   ├── login.html
+│   ├── signup.html
+│   └── ...
+├── Dockerfile                   # Production container image
+├── docker-compose.yml           # Local dev with Memcached
+├── package.json                 # Node dependencies
+├── .env                         # Local env overrides (gitignored)
+├── .dockerignore                # Exclude node_modules, data, .git
+├── README.md                    # This file
+├── ARCHITECTURE.md              # System design documentation
+└── API_REFERENCE.md             # API endpoint reference
+```
+
+## 🔒 Security
+
+- **No public S3 access**: All objects are private; access via presigned URLs only.
+- **JWT verification**: Every protected route validates Cognito JWTs.
+- **Secrets management**: Sensitive values loaded from AWS Secrets Manager at runtime.
+- **IAM roles**: EC2 instance uses IAM role; no hardcoded credentials.
+- **CORS**: Configurable via `CORS_ORIGIN` env var.
+
+## 🛠️ Configuration
+
+### AWS Secrets Manager
+
+The app loads a JSON secret at `group57/A2/secret`:
+
+```json
+{
+  "COGNITO_CLIENT_SECRET": "...",
+  "HF_API_TOKEN": "hf_..."
+}
+```
+
+### AWS Systems Manager Parameter Store
+
+Parameters are loaded from `/cab432/g57/app/` prefix:
+
+- `AWS_REGION`
+- `PORT`
+- `JWT_EXPIRES`
+- `HF_IMAGE_MODEL`
+- `TAGS_TOP_K`
+- `TAGS_MIN_SCORE`
+- `QUT_USERNAME`
+- `TRANSCODE_LOCK_TTL_MS`
+
+### Local Overrides
+
+For local dev, set environment variables in `.env` or shell to bypass Parameter Store:
+
+```bash
+export USE_PARAMETER_STORE=false
+export AWS_REGION=ap-southeast-2
+export PORT=8000
+# etc.
+```
+
+## 🐛 Troubleshooting
+
+### Build fails with "invalid file request"
+- **Cause**: OneDrive placeholder files or wrong build directory.
+- **Fix**: Ensure repo is "Always keep on this device" in OneDrive, or move outside OneDrive.
+
+### Worker not processing videos
+- **Symptoms**: Videos stuck in "queued" status.
+- **Checks**:
+  - Worker logs: `docker logs cab432-app` (look for `[worker] <worker-id> starting`)
+  - DynamoDB lock TTL: ensure `TRANSCODE_LOCK_TTL_MS` is reasonable (default 5 minutes)
+  - FFmpeg: `docker exec cab432-app ffmpeg -version`
+
+### Cache not working
+- **Symptoms**: Always `CACHE_MISS` in logs.
+- **Checks**:
+  - Memcached endpoint: `echo $MEMCACHED_ENDPOINT`
+  - Connectivity: `telnet <memcached-host> 11211`
+  - Logs: check `[cache]` warnings
+
+### Cognito errors
+- **Symptoms**: "Invalid credentials" or "User not confirmed".
+- **Checks**:
+  - User confirmed: check Cognito console or confirm via `/auth/confirm`
+  - Client secret: verify in Secrets Manager matches Cognito app client
+  - JWT expiry: tokens expire; login again if stale
+
+## 📈 Performance & Scaling
+
+- **Stateless design**: Restart or scale horizontally without data loss.
+- **Memcached caching**: Video list queries cached with namespace invalidation on mutations.
+- **Worker concurrency**: Single worker processes one job at a time; deploy multiple instances for parallel processing (DynamoDB locks prevent collisions).
+- **S3 presigned URLs**: Clients download/upload directly from S3, offloading traffic from the app server.
+
+## 📝 License
+
+ISC (see `package.json`)
+
+## 👥 Contributors
+
+- **Group 57**: QUT CAB432 Assessment 2 (2025)
+
+## 🔗 Related Documentation
+
+- [ARCHITECTURE.md](./ARCHITECTURE.md) - System design and cloud integration
+- [API_REFERENCE.md](./API_REFERENCE.md) - Complete API endpoint reference
+- [deploy.md](./deploy.md) - Detailed deployment guide (if exists)
+
+---
+
+**For questions or issues, consult the assignment specification or contact the teaching team.**
+## Microservices Deployment
+
+- **Service split**: `Dockerfile` builds the Express API container, `Dockerfile.worker` builds the CPU-intensive `transcodeWorker` service. Each service runs independently (ECS task or EC2 instance) and only shares AWS resources such as S3, DynamoDB, Parameter Store, Secrets Manager, and ElastiCache.
+- **API runtime**: start locally with `npm run api` (or `docker compose up app`), which executes `src/api/service.js` so the Express microservice can be deployed independently of workers.
+- **Local compose**: `docker compose up --build` now starts `app`, `worker`, and `memcached`. To run only the worker for isolated testing use `docker compose up worker memcached`.
+- **Manual job injection**: If the API service is not yet available you can enqueue a job by (1) uploading an `original.mp4` into `s3://$S3_BUCKET/user/<USER_ID>/videos/<VIDEO_ID>/original.mp4`, and (2) inserting the matching DynamoDB item with status `queued` (see `src/lib/paths.js::videoRepo.create` for the item shape). The worker will poll DynamoDB and pick it up.
+- **Local env**: Supply AWS credentials (via `~/.aws` volume) and either set `USE_PARAMETER_STORE=false` with explicit env vars in `.env`, or sign in with AWS SSO so the worker can read Parameter Store and Secrets Manager at startup.
+- **ECS rollout**: Create a separate ECS/Fargate service for the worker image (e.g., `cab432-worker`) using the same IAM task role as the API, allocate higher CPU/memory, and point the task definition command to `npm run worker`. The service can scale independently using CloudWatch alarms on job backlog metrics.

@@ -9,13 +9,18 @@ output "worker_dlq_url" {
 }
 
 output "lambda_function_name" {
-  description = "Name of the S3 upload dispatch Lambda"
-  value       = aws_lambda_function.s3_dispatch.function_name
+  description = "Name of the custom scaling Lambda"
+  value       = aws_lambda_function.custom_metric.function_name
 }
 
 output "ecs_service_name" {
   description = "Deployed ECS worker service"
   value       = aws_ecs_service.worker.name
+}
+
+output "service_discovery_hostname" {
+  description = "Cloud Map DNS name for the worker service"
+  value       = "${aws_service_discovery_service.worker.name}.${aws_service_discovery_private_dns_namespace.app.name}"
 }
 
 output "ssm_prefix" {

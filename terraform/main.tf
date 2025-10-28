@@ -10,10 +10,36 @@ locals {
 }
 
 # ---------------------------
+# Service discovery namespace (Cloud Map)
+# ---------------------------
+resource "aws_service_discovery_private_dns_namespace" "app" {
+  name        = "${local.project_prefix}.local"
+  description = "Private namespace for ${local.project_prefix} services"
+  vpc         = var.vpc_id
+}
+
+resource "aws_service_discovery_service" "worker" {
+  name = "${local.project_prefix}-worker"
+
+  dns_config {
+    namespace_id = aws_service_discovery_private_dns_namespace.app.id
+    dns_records {
+      ttl  = 30
+      type = "A"
+    }
+    routing_policy = "MULTIVALUE"
+  }
+
+  health_check_custom_config {
+    failure_threshold = 1
+  }
+}
+
+# ---------------------------
 # SQS Queue & Dead Letter Queue
 # ---------------------------
 resource "aws_sqs_queue" "worker_dlq" {
-  name = "${local.project_prefix}-worker-dlq"
+  name = "a3-g58-workerqueue-dlq"
 
   tags = {
     qut-username = var.qut_username
@@ -95,12 +121,12 @@ resource "aws_ssm_parameter" "sqs_queue_url" {
 }
 
 # ---------------------------
-# Lambda: S3 upload dispatcher
+# Lambda: Custom backlog metric publisher
 # ---------------------------
-data "archive_file" "s3_dispatcher" {
+data "archive_file" "custom_metric" {
   type        = "zip"
-  source_file = "${path.module}/../lambda/s3-upload-dispatch/index.mjs"
-  output_path = "${path.module}/s3-upload-dispatch.zip"
+  source_file = "${path.module}/../lambda/transcode-metrics/index.mjs"
+  output_path = "${path.module}/lambda-custom-metric.zip"
 }
 
 data "aws_iam_policy_document" "lambda_assume" {
@@ -134,7 +160,7 @@ data "aws_iam_policy_document" "lambda_policy" {
   statement {
     effect = "Allow"
     actions = [
-      "sqs:SendMessage"
+      "sqs:GetQueueAttributes"
     ]
     resources = [aws_sqs_queue.worker_queue.arn]
   }
@@ -148,6 +174,13 @@ data "aws_iam_policy_document" "lambda_policy" {
     ]
     resources = ["arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*"]
   }
+  statement {
+    effect = "Allow"
+    actions = [
+      "ecs:DescribeServices"
+    ]
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "lambda_inline" {
@@ -155,11 +188,11 @@ resource "aws_iam_role_policy" "lambda_inline" {
   policy = data.aws_iam_policy_document.lambda_policy.json
 }
 
-resource "aws_lambda_function" "s3_dispatch" {
-  function_name = "${local.project_prefix}-s3-upload-dispatch"
+resource "aws_lambda_function" "custom_metric" {
+  function_name = "g58-lambda-customscaling"
   runtime       = "nodejs20.x"
   handler       = "index.handler"
-  filename      = data.archive_file.s3_dispatcher.output_path
+  filename      = data.archive_file.custom_metric.output_path
   role          = aws_iam_role.lambda_role.arn
 
   environment {
@@ -167,17 +200,12 @@ resource "aws_lambda_function" "s3_dispatch" {
       AWS_REGION             = var.aws_region
       PARAMETER_STORE_PREFIX = local.ssm_prefix
       SQS_QUEUE_PARAM_KEY    = "SQS_QUEUE_URL"
-      EXPECTED_BUCKET_NAME   = var.upload_bucket
+      CUSTOM_METRIC_NAMESPACE = var.custom_metric_namespace
+      WORKER_COUNT_BASELINE   = tostring(var.worker_count_baseline)
+      ECS_CLUSTER_NAME        = var.ecs_cluster_name
+      ECS_SERVICE_NAME        = var.ecs_service_name
     }
   }
-}
-
-resource "aws_lambda_permission" "allow_s3" {
-  statement_id  = "AllowExecutionFromS3"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.s3_dispatch.function_name
-  principal     = "s3.amazonaws.com"
-  source_arn    = "arn:aws:s3:::${var.upload_bucket}"
 }
 
 # ---------------------------
@@ -207,6 +235,12 @@ resource "aws_ecs_task_definition" "worker" {
         { name = "USE_PARAMETER_STORE", value = "true" },
         { name = "SQS_QUEUE_URL", value = aws_sqs_queue.worker_queue.id }
       ]
+      portMappings = [
+        {
+          containerPort = var.worker_container_port
+          protocol      = "tcp"
+        }
+      ]
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -234,6 +268,17 @@ resource "aws_ecs_service" "worker" {
 
   deployment_maximum_percent         = 200
   deployment_minimum_healthy_percent = 50
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  service_registries {
+    registry_arn   = aws_service_discovery_service.worker.arn
+    port           = var.worker_container_port
+    container_name = "worker"
+  }
 
   lifecycle {
     ignore_changes = [desired_count]
