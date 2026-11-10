@@ -95,8 +95,6 @@ export function authRoutes() {
         })
       );
 
-      console.log("🔑 Login result:", JSON.stringify(result, null, 2));
-
       // MFA Setup required (first-time setup)
       if (result.ChallengeName === "MFA_SETUP") {
         return res.json({
@@ -123,7 +121,7 @@ export function authRoutes() {
         });
       }
 
-      res.status(400).json({ error: "Unexpected login response", raw: result });
+      res.status(400).json({ error: "Unexpected login response" });
     } catch (err) {
       console.error("❌ Cognito login failed:", err);
       res.status(401).json({ error: "Invalid credentials" });
@@ -200,7 +198,7 @@ export function authRoutes() {
 
       const token = result.AuthenticationResult?.IdToken;
       if (!token) {
-        return res.status(400).json({ error: "No token returned", raw: result });
+        return res.status(400).json({ error: "No token returned" });
       }
 
       res.json({

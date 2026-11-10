@@ -2,19 +2,6 @@ import Memcached from "memcached";
 import { promisify } from "node:util";
 
 // =======================================================
-// 🔑 Memcached endpoint from environment / secrets manager
-// =======================================================
-const rawMemEnv = process.env.MEMCACHED_ENDPOINT;
-
-if (!rawMemEnv) {
-  console.error("❌ MEMCACHED_ENDPOINT not set. Make sure AWS Secrets Manager is loading it!");
-  process.exit(1); // stop the app instead of silently using local
-}
-
-const memcachedAddress = rawMemEnv;
-console.log(`[cache] MEMCACHED_ENDPOINT='${rawMemEnv}' (using '${memcachedAddress}')`);
-
-// =======================================================
 // State
 // =======================================================
 let memcached = null;
@@ -50,6 +37,8 @@ function memDelLocal(key) {
 // =======================================================
 export function connectToMemcached() {
   if (memcached) return memcached;
+  const memcachedAddress = process.env.MEMCACHED_ENDPOINT;
+  if (!memcachedAddress) throw new Error("MEMCACHED_ENDPOINT is not set");
   memcached = new Memcached(memcachedAddress, {
     retries: 1,
     retry: 100,         // ms between retries

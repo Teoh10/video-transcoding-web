@@ -17,25 +17,27 @@ function getParameterName(key) {
 
 async function fetchParameters(keys) {
   const client = new SSMClient({ region: getClientRegion() });
-  const names = keys.map(getParameterName);
-
-  const response = await client.send(
-    new GetParametersCommand({
-      Names: names,
-      WithDecryption: true
-    })
-  );
-
-  if (response.InvalidParameters?.length) {
-    throw new Error(
-      `[parameter-store] Missing parameters: ${response.InvalidParameters.join(", ")}`
+  for (let i = 0; i < keys.length; i += 10) {
+    const batch = keys.slice(i, i + 10);
+    const names = batch.map(getParameterName);
+    const response = await client.send(
+      new GetParametersCommand({
+        Names: names,
+        WithDecryption: true
+      })
     );
-  }
 
-  for (const param of response.Parameters || []) {
-    const key = keys[names.indexOf(param.Name)];
-    parameterMap.set(key, param.Value ?? "");
-    process.env[key] = param.Value ?? "";
+    if (response.InvalidParameters?.length) {
+      throw new Error(
+        `[parameter-store] Missing parameters: ${response.InvalidParameters.join(", ")}`
+      );
+    }
+
+    for (const param of response.Parameters || []) {
+      const key = batch[names.indexOf(param.Name)];
+      parameterMap.set(key, param.Value ?? "");
+      process.env[key] = param.Value ?? "";
+    }
   }
 }
 
